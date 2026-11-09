@@ -141,52 +141,125 @@ is accounted for.
 Good enough that `RF.FreqCorr` can stay at 0, and `RF.FreqRaster` can be set to 1 (no rounding) —
 the 28.125 kHz raster is an RTL-SDR workaround that the LMS7002M synthesiser does not need.
 
-## Noise floor — and why there must be no antenna attached
+## Is the antenna working? Yes
 
-Gain sweep at 868.300 MHz, manual gain, 1 M samples per step:
+An 868 MHz omni antenna is connected to **RX1_L** (the `LNAL` path the backend selects for
+anything under 1500 MHz). The way to tell that it is live is not the level at 868 MHz — that band
+is quiet — but the level at frequencies that are certainly busy. Measured with a 4 MSps capture,
+50 dB gain, averaged periodogram, FFT bins about 1 kHz wide:
+
+| Frequency | What is there | Noise floor |
+|---|---|---|
+| 780 MHz | DVB-T2 / UHF broadcast | **−52.9 dBFS** |
+| 800 MHz | LTE800 downlink | **−49.8 dBFS** |
+| 868.3 MHz | OGN | **−69.6 dBFS** |
+
+The floor is **17–20 dB higher** at the two busy frequencies. That difference is the antenna
+delivering real ambient RF, and it is what an unconnected port cannot do — before the antenna was
+attached every one of the five LNA paths measured the same flat floor at every frequency,
+including 100 MHz, where an antenna shows broadcast FM at enormous amplitude. There is also a
+sharp DC/LO spur 30 dB above the local floor at the tuned centre, which is a further sign of a
+live front end.
+
+**The 868 MHz band itself is quiet right now.** Both OGN channels sit at the noise floor
+(+0.06 dB and +0.05 dB above it) — no OGN transmitter is audible at this location at this moment.
+That is not a fault; OGN is a low-duty-cycle network with few transmitters, received with an omni
+in a room. What this means is that the receiver and the software chain can be verified, and packet
+decoding has to wait for a transmitter to be in range.
+
+Reproduce with:
+
+```bash
+./scripts/spectrum-limesdr.sh 868.3 4        # needs the antenna to show anything interesting
+```
+
+## Gain — what it does now that there is a real input
+
+With the antenna connected, gain behaves as it should. At 800 MHz, where there is a lot of signal:
 
 ```
-  gain [dB]   mean8    sd8    min8  max8   clip-low clip-high  raw-I[min..max]
-       0.0   -0.24   0.43    127   128     0.000%     0.000%     -64..64
-      10.0   -0.25   0.43    127   128     0.000%     0.000%    -224..16
-      20.0   -0.27   0.46    126   128     0.000%     0.000%    -320..16
-      30.0   -0.26   0.44    127   128     0.000%     0.000%    -144..32
-      40.0   -0.25   0.45    125   129     0.000%     0.000%    -576..112
-      50.0   -0.26   0.45    125   129     0.000%     0.000%    -384..400
-      61.0   -0.28   0.86    118   133     0.000%     0.000%   -1216..1344
+gain [dB]   noise floor
+     -12       -73.73 dBFS
+       0       -73.00
+      20       -71.77
+      40       -56.41
+      61       -36.87
 ```
 
-A healthy OGN receiver at 1 MSps shows roughly 10 counts of standard deviation in these 8-bit
-units. This sees 0.4–0.9 — one to one-and-a-half bits of a 12-bit converter, which is what an
-input with nothing on it looks like. The flattening up to 50 dB is the ADC's own quantisation
-floor dominating; the noise of the signal path only rises above it at maximum gain.
+From 20 dB to 61 dB the floor rises 35 dB, so the gain chain is working. The flat part at the
+bottom is the receiver's own converter floor: below about 20 dB the amplified antenna noise has
+not yet climbed above it.
 
-Two more checks, both pointing the same way:
+At **868.3 MHz** the same sweep, and this is the number that matters:
 
 ```
-$ ./limesdr_probe -n 500000 -g 50 -A         # every LNA path in turn
-  path    mean8    sd8    min8  max8   raw-I[min..max]
-  LNAH    -0.25   0.44    127   129    -256..96
-  LNAL    -0.27   0.48    125   129    -368..336
-  LNAW    -0.24   0.45    126   130    -400..592
-  LB1     -0.26   0.44    126   128    -288..80
-  LB2     -0.26   0.47    126   128    -336..64
+gain [dB]   noise floor     8-bit sd
+      30      -73.66 dBFS      0.43
+      40      -73.55           0.43
+      50      -72.92           0.49
+      55      -69.65           0.69
+      61      -64.24           1.33
 ```
 
-All five connectors measure the same. And across frequencies:
+At 50 dB the receiver is 0.7 dB above its own converter floor — it is listening to itself, not to
+the antenna. At **61 dB** (the top of the range) it is ~9 dB above that floor, i.e. genuinely
+antenna-noise limited. That is why the shipped configuration sets `RF.OGN.Gain = 61.0`; the
+earlier value of 50 was chosen before an antenna existed.
 
-| Frequency | sd8 at 50 dB |
-|---|---|
-| 100 MHz (FM broadcast — loud with any antenna) | 0.60 |
-| 433.920 MHz (ISM) | 0.59 |
-| 868.300 MHz (OGN) | 0.50 |
-| 915.000 MHz | 0.64 |
+The remaining headroom is not available: 61 dB is the maximum the board reports, so the only way
+to get more signal out of 868 MHz would be a better antenna or an external LNA.
 
-If an antenna were attached anywhere, 100 MHz would be enormous. It is not: **no RF input is
-connected to the LimeSDR**. That is why live OGN decoding cannot be demonstrated on this setup yet,
-and it is the first thing to fix before drawing conclusions about reception quality.
+## Decimation and oversampling — measured, and not the lever here
+
+The LMS7002M does not sample at the rate you ask for; it decimates internally, and SoapyLMS7 exposes
+the ratio as the `OVERSAMPLING` setting ("oversampling ratio (0 - auto)"). With `OVERSAMPLING = N`
+the converter runs at N × the host rate and the on-chip CIC/FIR chain decimates by N, so a request
+for 1 MSps still delivers 1 MSps to the host. That is exactly the "capture higher, deliver what
+ogn-rf needs" arrangement, and it is now exposed as `RF.Oversample` in ogn-rf.
+
+It measures as **neutral on this link**, and the reason is worth stating because it tells you when
+it *would* help.
+
+**In-band noise density is invariant.** A native 1 MSps capture and a 4 MSps capture, same gain,
+868.3 MHz, normalised to the same 1 Hz of bandwidth:
+
+| Capture | Floor, as measured | Bin width | Normalised |
+|---|---|---|---|
+| 1 MSps native | −64.23 dBFS | 244 Hz | **−88.1 dBFS/Hz** |
+| 4 MSps wide | −59.00 dBFS | 977 Hz | **−88.9 dBFS/Hz** |
+
+They agree to 0.8 dB. Decimating the wide capture down to 1 MSps cannot change that: the noise is
+already spread evenly across the band, so removing out-of-band noise does not lower the density
+inside it.
+
+**The device-side knob agrees.** At 868.3 MHz and 61 dB gain, `OVERSAMPLING` of 0, 2, 8 and 16 all
+give a floor of −64.2 to −64.3 dBFS; only 4 moved it (−61.9 dBFS, with the 8-bit samples
+momentarily reaching the rails, so treat that point as an outlier rather than a gain). At 30 dB
+gain, where the receiver *is* sitting on its converter floor, 0, 4 and 16 give −73.63, −73.84 and
+−73.65 dBFS — no change at all, which says that floor is not simple converter quantisation that
+averaging can remove.
+
+**Conclusion:** decimation cannot manufacture SNR that the antenna is not delivering. It is the
+right knob when the converter floor dominates — a short antenna, a low gain setting, or the HF
+bands where this front end is weak — and for suppressing a strong signal just outside the
+passband, which is the one case where a sharper on-chip decimation filter earns its place. For OGN
+at 868 MHz with this antenna it buys nothing, so the shipped configuration leaves
+`RF.Oversample = 0`.
+
+## The DC spur
+
+There is a spur at exactly the tuned frequency: −32 to −33 dBFS at 61 dB gain, about 31 dB above
+the local floor, 100 kHz away from each OGN channel. It is LO leakage / residual DC offset. Setting
+`CALIBRATE` to 0, 2.5, 10 or 40 MHz moves it by less than 0.7 dB, so on this gateware it is not
+something the automatic calibration removes. It does not sit in the OGN channels and ogn-rf filters
+each channel separately, but it does cost about 30 dB of the converter's scale, which is why the
+gain cannot simply be wound up until the OGN channel fills the 8-bit range.
 
 ## See also
 
-- [`ogn-rf-integration.md`](ogn-rf-integration.md) — how the backend maps these facts onto ogn-rf.
-- [`../scripts/probe-limesdr.sh`](../scripts/probe-limesdr.sh) — re-run all of the above.
+- [`ogn-rf-integration.md`](ogn-rf-integration.md) — how the backend maps these facts onto ogn-rf,
+  including `RF.Oversample`.
+- [`../scripts/probe-limesdr.sh`](../scripts/probe-limesdr.sh) — gain sweeps, per-LNA-path checks
+  and frequency scans.
+- [`../tools/spectrum.py`](../tools/spectrum.py) — the averaged periodogram behind every spectral
+  number above.

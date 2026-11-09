@@ -68,7 +68,8 @@ struct Capture
 { double GainDb; Stats St; double Mean8, Sd8, DcI, DcQ; };
 
 static int doCapture(SoapySDR::Device *Dev, SoapySDR::Stream *Stream, size_t Mtu,
-                     double GainDb, long SamplesWanted, int Shift, int Verbose, Stats &St)
+                     double GainDb, long SamplesWanted, int Shift, int Verbose, Stats &St,
+                     FILE *Out=0)
 { // Manual gain: without this an AGC setting silently overrides every setGain() below, and the
   // whole sweep reads flat no matter what gain is asked for.
   Dev->setGainMode(SOAPY_SDR_RX, 0, false);
@@ -76,6 +77,8 @@ static int doCapture(SoapySDR::Device *Dev, SoapySDR::Stream *Stream, size_t Mtu
 
   std::vector<int16_t> Buf(2*Mtu);
   void *Buffs[1]; Buffs[0]=&Buf[0];
+
+  std::vector<uint8_t> Row(2*Mtu);            // converted 8-bit I/Q for one readStream chunk
 
   long Done=0; int Timeouts=0;
   double SumI=0, SumQ=0, NAcc=0, Sum8=0, SumSq8=0, ClipLow=0, ClipHigh=0;
@@ -106,6 +109,14 @@ static int doCapture(SoapySDR::Device *Dev, SoapySDR::Stream *Stream, size_t Mtu
       double A=U8I-128.0, B=U8Q-128.0;
       Sum8 += 0.5*(A+B);
       SumSq8 += 0.5*(A*A+B*B); }
+
+    if(Out)
+    { for(int Idx=0; Idx<Ret; Idx++)
+      { int16_t I=Buf[2*Idx+0], Q=Buf[2*Idx+1];
+        int U8I=(I>>Shift)+128; if(U8I<0) U8I=0; if(U8I>255) U8I=255;
+        int U8Q=(Q>>Shift)+128; if(U8Q<0) U8Q=0; if(U8Q>255) U8Q=255;
+        Row[2*Idx+0]=(uint8_t)U8I; Row[2*Idx+1]=(uint8_t)U8Q; }
+      fwrite(&Row[0], 1, 2*Ret, Out); }
 
     Done+=Ret; St.Samples+=Ret; NAcc+=2.0*Ret;
     if(Verbose && (St.Samples % (1<<18) < (uint64_t)Ret))
@@ -141,6 +152,68 @@ static int doSweep(SoapySDR::Device *Dev, long SamplesWanted, int Shift,
     Dev->deactivateStream(Stream); Dev->closeStream(Stream); }
   return 0; }
 
+
+// ---------------------------------------------------------------------------------------------
+// Frequency scan: is the antenna delivering energy anywhere, and where?
+//
+// Tunes across a range and reports the mean power at each step, so an antenna that is not
+// connected (flat, featureless floor) can be told apart from one that is (structure: broadcast,
+// cellular downlinks, ISM activity) without needing a demodulator to work.
+// ---------------------------------------------------------------------------------------------
+static int doScan(SoapySDR::Device *Dev, double From, double To, double Step,
+                  double GainDb, long SamplesWanted)
+{ Dev->setGainMode(SOAPY_SDR_RX, 0, false);
+  Dev->setGain(SOAPY_SDR_RX, 0, GainDb);
+
+  SoapySDR::Stream *Stream=Dev->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16, std::vector<size_t>(1,0));
+  if(Stream==0) { fprintf(stderr,"setupStream failed\n"); return -1; }
+  size_t Mtu=Dev->getStreamMTU(Stream);
+  Dev->activateStream(Stream);
+
+  std::vector<int16_t> Buf(2*Mtu);
+  void *Buffs[1]; Buffs[0]=&Buf[0];
+
+  struct Row { double Freq, Db; };
+  std::vector<Row> Rows;
+  double MinDb=1e9, MaxDb=-1e9;
+
+  for(double F=From; F<=To+0.5*Step; F+=Step)
+  { Dev->setFrequency(SOAPY_SDR_RX, 0, F);
+
+    // Let the PLL and the baseband settle, and throw those samples away
+    int Flags=0; long long TimeNs=0;
+    for(int Flush=0; Flush<6; Flush++)
+      Dev->readStream(Stream, Buffs, Mtu, Flags, TimeNs, 100000);
+
+    double Sum=0; long N=0;
+    while(N<SamplesWanted)
+    { size_t Want=Mtu;
+      int Ret=Dev->readStream(Stream, Buffs, Want, Flags, TimeNs, 200000);
+      if(Ret==SOAPY_SDR_TIMEOUT || Ret==SOAPY_SDR_OVERFLOW) continue;
+      if(Ret<0) break;
+      for(int Idx=0; Idx<Ret; Idx++)
+      { double I=Buf[2*Idx+0], Q=Buf[2*Idx+1];
+        Sum += I*I + Q*Q; }
+      N+=Ret; }
+
+    if(N<=0) continue;
+    double P=Sum/(2.0*N);
+    double Db=10.0*log10(P+1e-12);
+    Rows.push_back(Row{F, Db});
+    if(Db<MinDb) MinDb=Db;
+    if(Db>MaxDb) MaxDb=Db; }
+
+  Dev->deactivateStream(Stream); Dev->closeStream(Stream);
+
+  printf("  freq [MHz]   power [dB]  profile (%.0f..%.0f dB)\n", MinDb, MaxDb);
+  double Span=MaxDb-MinDb; if(Span<1) Span=1;
+  for(size_t Idx=0; Idx<Rows.size(); Idx++)
+  { int Bars=(int)((Rows[Idx].Db-MinDb)/Span*60.0);
+    printf("  %9.3f   %8.2f  ", 1e-6*Rows[Idx].Freq, Rows[Idx].Db);
+    for(int B=0; B<Bars; B++) putchar('#');
+    putchar('\n'); }
+  return 0; }
+
 // ---------------------------------------------------------------------------------------------
 int main(int argc, char **argv)
 { const char *Serial=0;
@@ -151,9 +224,11 @@ int main(int argc, char **argv)
   int AllAntennas=0;
   std::vector<double> Sweep;
   int Verbose=1, Shift=8, TestSignal=(-1);
+  int Scan=0; double ScanFrom=0, ScanTo=0, ScanStep=0;
+  std::vector<std::string> Settings;      // -X key=value, applied before the sample rate
 
   int Opt;
-  while((Opt=getopt(argc, argv, "d:f:r:g:n:o:s:a:Athq"))!=-1)
+  while((Opt=getopt(argc, argv, "d:f:r:g:n:o:s:a:S:X:thq"))!=-1)
   { switch(Opt)
     { case 'd': Serial=optarg; break;
       case 'f': Freq=atof(optarg); break;
@@ -163,6 +238,16 @@ int main(int argc, char **argv)
       case 'o': OutFile=optarg; break;
       case 'a': Antenna=optarg; break;
       case 'A': AllAntennas=1; break;
+      case 'X': Settings.push_back(optarg); break;
+      case 'S': { Scan=1; std::string Spec=optarg;
+                  double V[3]={0,0,0}; int Field=0; size_t Pos=0;
+                  while( (Pos<Spec.size()) && (Field<3) )
+                  { size_t Colon=Spec.find(':', Pos);
+                    if(Colon==std::string::npos) Colon=Spec.size();
+                    V[Field++]=atof(Spec.substr(Pos, Colon-Pos).c_str());
+                    Pos=Colon+1; }
+                  ScanFrom=1e6*V[0]; ScanTo=1e6*V[1]; ScanStep=1e6*(V[2]>0?V[2]:1.0); }
+                break;
       case 's': { std::string List=optarg; size_t Pos=0;
                   while(Pos<List.size())
                   { size_t Comma=List.find(',', Pos);
@@ -174,7 +259,9 @@ int main(int argc, char **argv)
       case 'q': Verbose=0; break;
       case 'h': default:
         printf("usage: %s [-d serial] [-f Hz] [-r Hz] [-g dB] [-n samples] [-o file.u8]\n"
-               "          [-s gain,gain,...] [-a LNAL|LNAH|LNAW] [-A] [-t] [-q]\n"
+               "          [-s gain,gain,...] [-a LNAL|LNAH|LNAW] [-A] [-S from:to:step] [-t] [-q]\n"
+               "  -S  scan from:to:step in MHz, reporting power per step\n"
+               "  -X  key=value device setting, repeatable (e.g. -X OVERSAMPLING=4)\n"
                "  -s  sweep these gains, one capture each\n"
                "  -a  select an LNA path explicitly (default: chosen from the frequency)\n"
                "  -A  try every LNA path in turn (find out which connector the antenna is on)\n"
@@ -221,6 +308,15 @@ int main(int argc, char **argv)
   int Ret=0;
   try
   {
+    // Device settings first: OVERSAMPLING in particular decides how the rate below is reached,
+    // so it has to be in place before setSampleRate() configures the converter chain.
+    for(size_t Idx=0; Idx<Settings.size(); Idx++)
+    { size_t Eq=Settings[Idx].find('=');
+      if(Eq==std::string::npos) { fprintf(stderr,"bad setting '%s' (want key=value)\n", Settings[Idx].c_str()); continue; }
+      std::string Key=Settings[Idx].substr(0, Eq), Val=Settings[Idx].substr(Eq+1);
+      try { Dev->writeSetting(Key, Val); printf("setting       : %s = %s\n", Key.c_str(), Val.c_str()); }
+      catch(const std::exception &Ex) { fprintf(stderr,"cannot set %s=%s: %s\n", Key.c_str(), Val.c_str(), Ex.what()); } }
+
     Dev->setSampleRate(SOAPY_SDR_RX, 0, Rate);
     printf("sample rate   : %.0f Hz requested, %.3f Hz set\n", Rate, Dev->getSampleRate(SOAPY_SDR_RX,0));
 
@@ -245,7 +341,12 @@ int main(int argc, char **argv)
     SoapySDR::Range Range=Dev->getGainRange(SOAPY_SDR_RX,0);
     printf("gain range    : %.1f .. %.1f dB\n", Range.minimum(), Range.maximum());
 
-    if(AllAntennas)
+    if(Scan)
+    { printf("\nscanning %.1f .. %.1f MHz in %.3f MHz steps at %.1f dB gain\n",
+             1e-6*ScanFrom, 1e-6*ScanTo, 1e-6*ScanStep, GainDb);
+      Ret=doScan(Dev, ScanFrom, ScanTo, ScanStep, GainDb, SamplesWanted);
+    }
+    else if(AllAntennas)
     { // Which connector is the antenna actually on? A path that is not connected shows only
       // leakage and sits ~20 dB below one that is, which is easy to see in sd8.
       printf("\nper-LNA-path capture at %.1f dB gain\n", GainDb);
@@ -272,8 +373,14 @@ int main(int argc, char **argv)
       { size_t Mtu=Dev->getStreamMTU(Stream);
         Dev->activateStream(Stream);
 
+        FILE *Out=0;
+        if(OutFile)
+        { Out=fopen(OutFile,"wb");
+          if(Out==0) { fprintf(stderr,"cannot write %s\n", OutFile); Ret=1; }
+          else printf("output        : %s\n", OutFile); }
+
         Stats St;
-        if(doCapture(Dev, Stream, Mtu, GainDb, SamplesWanted, Shift, Verbose, St)<0) Ret=2;
+        if(doCapture(Dev, Stream, Mtu, GainDb, SamplesWanted, Shift, Verbose, St, Out)<0) Ret=2;
         else
         { printf("\ncapture       : %llu complex samples at %.1f dB gain\n", (unsigned long long)St.Samples, GainDb);
           printf("raw int16     : I %6.0f..%-6.0f mean %7.1f   Q %6.0f..%-6.0f mean %7.1f\n",
@@ -286,32 +393,10 @@ int main(int argc, char **argv)
           if(St.Overflows) printf("overflows     : %d (samples were lost by the driver)\n", St.Overflows);
           if(St.Samples==0) Ret=2;
 
-          if(OutFile)
-          { FILE *File=fopen(OutFile,"wb");
-            if(File==0) { fprintf(stderr,"cannot write %s\n", OutFile); Ret=1; }
-            else
-            { // capture again straight to the file, so the file matches the stats above
-              Dev->deactivateStream(Stream);
-              Stream=Dev->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16, std::vector<size_t>(1,0));
-              Mtu=Dev->getStreamMTU(Stream); Dev->activateStream(Stream);
-              std::vector<int16_t> Buf(2*Mtu);
-              void *Buffs[1]; Buffs[0]=&Buf[0];
-              long Done=0;
-              while(Done<SamplesWanted)
-              { size_t Want=Mtu; if((long)Want>SamplesWanted-Done) Want=SamplesWanted-Done;
-                int Flags=0; long long TimeNs=0;
-                int Got=Dev->readStream(Stream, Buffs, Want, Flags, TimeNs, 500000);
-                if(Got==SOAPY_SDR_TIMEOUT || Got==SOAPY_SDR_OVERFLOW) continue;
-                if(Got<0) break;
-                std::vector<uint8_t> Out(2*Got);
-                for(int Idx=0; Idx<2*Got; Idx++)
-                { int Val=(Buf[Idx]>>Shift)+128; if(Val<0) Val=0; if(Val>255) Val=255; Out[Idx]=(uint8_t)Val; }
-                fwrite(&Out[0], 1, Out.size(), File);
-                Done+=Got; }
-              fclose(File);
-              printf("output        : %s (%ld samples, interleaved 8-bit I/Q)\n", OutFile, Done); } }
+          if(Out) printf("              : %llu samples, interleaved 8-bit I/Q\n", (unsigned long long)St.Samples);
 
           Dev->deactivateStream(Stream); }
+        if(Out) fclose(Out);
         Dev->closeStream(Stream); } }
     else
     { printf("\ngain sweep over %ld samples each\n", SamplesWanted);
