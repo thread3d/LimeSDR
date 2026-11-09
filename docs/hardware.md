@@ -239,12 +239,27 @@ gain, where the receiver *is* sitting on its converter floor, 0, 4 and 16 give �
 −73.65 dBFS — no change at all, which says that floor is not simple converter quantisation that
 averaging can remove.
 
-**Conclusion:** decimation cannot manufacture SNR that the antenna is not delivering. It is the
-right knob when the converter floor dominates — a short antenna, a low gain setting, or the HF
-bands where this front end is weak — and for suppressing a strong signal just outside the
-passband, which is the one case where a sharper on-chip decimation filter earns its place. For OGN
-at 868 MHz with this antenna it buys nothing, so the shipped configuration leaves
-`RF.Oversample = 0`.
+**The setting also appears to do nothing at all on this build.** Every ratio from 0 to 4096 is
+accepted without complaint and produces statistically identical output — same noise floor, same
+OGN channel levels, same DC spur, to within 0.1 dB:
+
+| `OVERSAMPLING` | noise floor | 868.200 | 868.400 | DC spur |
+|---|---|---|---|---|
+| 0 (auto) | −62.88 dBFS | +0.39 dB | +0.30 dB | −33.79 dBFS |
+| 32 | −62.86 | +0.41 | +0.30 | −34.36 |
+| 128 | −62.89 | +0.22 | +0.08 | −33.86 |
+
+A ratio of 4096 at a 1 MSps host would mean a 4 GSps converter, which the LMS7002M obviously does
+not do, and it is accepted just the same. The conclusion is that LimeSuite 20.01 stores the value
+and does not use it to reconfigure the converter chain here, so this is a **no-op setting on this
+software build** rather than a neutral-but-working one.
+
+**Conclusion:** decimation cannot manufacture SNR that the antenna is not delivering, and on this
+LimeSuite build asking for it changes nothing measurable. `RF.Oversample` is nevertheless set to
+the highest meaningful ratio (32 — the converter tops out near 61.44 MSps, so that is about as
+far as a 1 MSps host rate can oversample) because that is the correct configuration wherever the
+knob does take effect. If a device cannot deliver the host rate with the ratio asked for, the
+backend retries once with auto rather than failing to open.
 
 ## The DC spur
 
@@ -254,6 +269,36 @@ the local floor, 100 kHz away from each OGN channel. It is LO leakage / residual
 something the automatic calibration removes. It does not sit in the OGN channels and ogn-rf filters
 each channel separately, but it does cost about 30 dB of the converter's scale, which is why the
 gain cannot simply be wound up until the OGN channel fills the 8-bit range.
+
+## Sample rate ceiling — three different numbers
+
+"Can it sample at 60 MSps?" has three answers depending on which limit is meant, and they matter
+because only the last one applies to how this board is wired.
+
+| Limit | Value | Evidence |
+|---|---|---|
+| LMS7002M converter specification | **61.44 MSps** | 2 × the 30.72 MHz reference; this is the figure the clocking is built around |
+| What SoapyLMS7 advertises/allows | **0.1 – 65 MSps** | `SoapySDRUtil --probe`; 65 MSps is accepted (sets 64 999 999.7 Hz), 80 MSps fails with `setSampleRate(Rx, 0, 80 MHz) Failed` |
+| What this **USB 2.0** link sustains | **~4.1 MSps** | 61.44 MSps requested → 4.07 MSps delivered, 6.6 % of real time |
+
+So "about 60" is right as the chip figure — 61.44 MSps exactly — but configuring a rate is not the
+same as sustaining one. Asked for 61.44 MSps the device accepts and then delivers 4.07 MSps, because
+it is on USB 2.0. On USB 3 the picture would be different; this board has it behind a USB 2.0 hub.
+
+### Why the host runs at 2 MSps
+
+The chain is `ogn-rf` (open, RF acquisition) → `ogn-decode` (closed source, demodulator), and
+2 MSps is the highest rate the decoder accepts. 2 MSps sits comfortably inside the ~4.1 MSps the
+link sustains (measured at 100.4 % of real time), so `RF.SampleRate = 2000000` is used.
+
+It buys margin for the demodulator, not range: the two OGN channels occupy about 250 kHz and sit at
+±100 kHz around the 868.300 MHz centre, which 1 MHz already covered, and in-band noise density is
+invariant with sample rate (see the decimation section). Both channels land well inside the ±1 MHz
+window at 2 MSps.
+
+Note that `ogn-decode` is not installed on this board and is not open source, so its 2 MSps limit is
+taken as given rather than measured here. The rate it is sensitive to is the RF rate that scales the
+Fourier spectra `ogn-rf` hands it through `ogn-rf.fifo`.
 
 ## See also
 

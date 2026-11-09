@@ -60,6 +60,7 @@ the interface the rest of the system already speaks, and it keeps a future secon
 | `ResetBuffer()` | `readStream()` with a zero timeout until nothing is pending |
 | `setCenterFreq()` | `setFrequency()`; the freq raster is applied first, exactly as librtlsdr does |
 | `setFreqCorrection(ppm)` | **software**: retunes the LO to `freq × (1 + ppm·1e-6)` |
+| `RF.Oversample` | sets SoapyLMS7's `OVERSAMPLING`: converter runs at N × the host rate, on-chip decimation by N |
 | `getCenterFreq()` | the *nominal* frequency, i.e. before the ppm correction, so reports stay nominal |
 | `setTunerGain(0.1 dB)` | `setGain()` in dB, clamped to the reported gain range |
 | `getTunerGains()` | synthesised from `getGainRange()` into the same 0.1 dB table format |
@@ -105,8 +106,9 @@ RF = {
   DeviceSerial = "00090726074D1731";
   FreqPlan     = 1;              // Europe/Africa: 868.200 and 868.400 MHz
   FreqRaster   = 1;              // no raster rounding - unnecessary on an LMS7002M
-  SampleRate   = 1000000;
-  OGN = { Gain = 50.0; GainMode = 1; SampleRate = 1000000;
+  SampleRate   = 2000000;        // highest rate ogn-decode accepts; link sustains ~4.1 MSps
+  Oversample   = 32;             // stepped down to 16 at 2 MSps to stay inside the converter
+  OGN = { Gain = 61.0; GainMode = 1; SampleRate = 2000000;
           SensTime = 0.85; StartTime = 0.375; };
 };
 ```
@@ -114,6 +116,34 @@ RF = {
 `RF.OGN.Gain` is in **dB** here, in the units SoapySDR reports, not an RTL-SDR tuner's discrete
 gain steps — ogn-rf multiplies by 10 internally and the backend converts back. A copy of this file
 is in [`../config/ogn-rf-limesdr.conf`](../config/ogn-rf-limesdr.conf).
+
+**2 MSps is deliberate.** It is the highest rate `ogn-decode` accepts, and it sits at about half of
+what this USB 2.0 link sustains (~4.1 MSps), so there is margin. It does not add sensitivity — the
+two channels occupy ~250 kHz around the centre and 1 MHz already covered them — it adds margin for
+the demodulator. The converter itself could do 61.44 MSps, but this link never delivers more than
+~4.1 MSps regardless of what is configured.
+
+**61 dB is deliberate, not arbitrary.** It is the top of this board's range, and it is where the
+receiver stops listening to its own converter floor and starts listening to the antenna: at 50 dB
+the measured noise floor sits 0.7 dB above the converter floor, at 61 dB it sits ~9 dB above it.
+That value would overload a busy band (at 800 MHz the ADC is already at 92 % of full scale), which
+is fine — OGN is at 868 MHz and the hopping plan covers a 200 kHz span there.
+
+`RF.Oversample` is implemented because it is the standard way to "capture higher, hand on what the
+application wants". It is set before `setSampleRate()`, because that call is what configures the
+converter chain, and the requested ratio is **stepped down to the largest power of two the
+converter can run at**: at 1 MSps that is 32, at the 2 MSps now used it is 16, because 32 × 2 MSps
+would ask for a 64 MSps converter and the LMS7002M tops out at 61.44 MSps. If the device cannot
+deliver the host rate with the ratio it was given, the open **retries once with auto** rather than
+failing — the host rate matters to the rest of the chain, the ratio does not.
+
+Both the requested and the applied ratio are reported, because they routinely differ:
+`RF.Oversample  32 (auto) / applied 16`.
+
+Be aware it measures as having no effect on this build — every ratio from 0 to 4096 gives identical
+output, which suggests LimeSuite 20.01 ignores it for this configuration. See the decimation section
+of [`hardware.md`](hardware.md) for the numbers. The status page reports both the requested and the
+applied ratio (`RF.Oversample  32 (auto) / applied 32`) so it is visible which one happened.
 
 ## Building
 
@@ -147,7 +177,12 @@ All on the board, with the branch built and running:
 | Sample statistics through ogn-rf | mean **127.5**, sd 0.50, min 126, max 129, **no clipping** |
 | Time-slot acquisition | continuous `Half time slot` / `Dropped a slot`, no read errors |
 | Long run | >80 s with **zero** timeouts and zero overflow-driven failures |
-| Sustained rate | 100.1 % of real time at 1 MSps |
+| Sustained rate | 100.1 % of real time at 1 MSps, 100.4 % at 2 MSps |
+| Runs at 2 MSps | opens as `2.000 Msps`, acquires and reads time slots, 1.7 M samples per slot |
+| Antenna live | noise floor 17–20 dB higher at 780/800 MHz than at 868 MHz |
+| Gain optimum | 61 dB; at 50 dB the floor was 0.7 dB above the receiver's own converter floor |
+| `RF.Oversample = 32` | accepted; host rate stays 1.000 MSps, banner reports `oversampling 32` |
+| Decimation benefit | none measurable: −88.1 vs −88.9 dBFS/Hz for native vs wide capture |
 
 The sample statistics were read back out of ogn-rf's own `/time-slot-rf.u8` endpoint, so they
 went through `LimeSDR::Read()` and not the standalone probe. Mean 127.5 against an expected 128 is
@@ -160,10 +195,10 @@ appears on the KrakenSDR/RTL-SDR build.
 
 ## Known limitations
 
-1. **No RF input is connected.** Every LNA path and a sweep across 100/433/868/915 MHz measure the
-   same noise floor, including at 100 MHz where any antenna would show broadcast FM. Live OGN
-   packet decoding therefore cannot be demonstrated on this setup. Attach an antenna and run
-   [`../scripts/verify-reception.sh`](../scripts/verify-reception.sh).
+1. **Nothing to decode yet.** An 868 MHz omni antenna is connected to RX1_L and the front end is
+   demonstrably live, but the band is quiet: both OGN channels measure at the noise floor
+   (+0.4 dB, +0.3 dB), so no packet can be demodulated until a transmitter is in range. Run
+   [`../scripts/verify-reception.sh`](../scripts/verify-reception.sh) to re-check.
 2. **RX0 only.** `LimeSDR::Channel` is 0. The board has two RX channels; using both (or using them
    coherently) is not implemented, and would need the two channels started and read in lockstep.
 3. **Gateware 2.23 against LimeSuite 20.01** (expects 2.22) warns at open. Working, but unexplained
