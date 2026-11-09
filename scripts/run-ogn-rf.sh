@@ -20,7 +20,7 @@ set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 CONF=${1:-$HERE/../config/ogn-rf-limesdr.conf}
 SECS=${2:-0}
-BIN=${BIN:-$HERE/../ogn-rf/ogn-rf}
+BIN=${BIN:-$HERE/../../ogn-rf/ogn-rf}
 
 if [ ! -x "$BIN" ]; then
   echo "no ogn-rf binary at $BIN - build it first with ./build-ogn-rf.sh" >&2
@@ -33,12 +33,16 @@ fi
 
 echo "config  : $CONF"
 echo "binary  : $BIN"
-grep -E "DeviceType|DeviceSerial|Gain |SampleRate" "$CONF" | sed 's/^/  /'
+grep -E "^[[:space:]]*(DeviceType|DeviceSerial|Gain|SampleRate)[[:space:]]*=" "$CONF" | sed 's/^/  /'
 
+# The stdin producer is what keeps ogn-rf alive, so a bounded run needs a bounded producer,
+# not "sleep infinity | timeout N ...": the pipeline would never return, because sleep does
+# not care that the receiver has exited. Letting stdin close after N seconds makes ogn-rf
+# leave its command loop and shut down in its own time.
 if [ "$SECS" -gt 0 ]; then
-  echo "running for ${SECS}s"
-  sleep infinity | timeout "$SECS" stdbuf -oL -eL "$BIN" "$CONF"
-  echo "[stopped after ${SECS}s, exit $?]"
+  echo "running for ${SECS}s (stdin closes after that, which is how ogn-rf exits)"
+  sleep "$SECS" | stdbuf -oL -eL "$BIN" "$CONF"
+  echo "[ogn-rf exited]"
 else
   echo "running until interrupted"
   sleep infinity | stdbuf -oL -eL "$BIN" "$CONF"

@@ -23,7 +23,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SECS=${1:-30}
 CONF=$HERE/../config/ogn-rf-limesdr.conf
 BIN=$HERE/../limesdr_probe
-OGN=${OGN:-$HERE/../ogn-rf/ogn-rf}
+OGN=${OGN:-$HERE/../../ogn-rf/ogn-rf}
 
 echo "==================== 1. raw sample spread ===================="
 if [ ! -x "$BIN" ]; then
@@ -86,10 +86,12 @@ pkill -x ogn-rf 2>/dev/null || true
 
 echo "ogn-rf live time: ${LIVE:-unknown} %   (100 % = every time slot read and handed on)"
 if [ -n "${LIVE:-}" ]; then
-  if awk "BEGIN{exit !($LIVE > 80)}"; then
-    echo "VERDICT: the receiver is keeping up with real time."
+  if awk "BEGIN{exit !($LIVE > 60)}"; then
+    echo "VERDICT: the receiver is reading and passing on most time slots."
   else
-    echo "VERDICT: live time is low - the DSP chain is not keeping up, not the radio."
+    echo "VERDICT: live time is low. Either the DSP chain cannot keep up, or nothing"
+    echo "         drained the output FIFO (ogn-rf halves then drops slots when its"
+    echo "         OutQueue fills). It is not itself evidence about the radio."
     echo "         Check the log: /tmp/ogn-rf-verify.log"
   fi
 fi

@@ -18,7 +18,7 @@
 set -u
 
 HERE=$(cd "$(dirname "$0")" && pwd)
-SRC=${1:-$HERE/../ogn-rf}
+SRC=${1:-$HERE/../../ogn-rf}
 OUT=${2:-ogn-rf}
 
 # Where libconfig / librtlsdr headers and libs live

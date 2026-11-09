@@ -21,6 +21,7 @@ SRC=$HERE/../src/limesdr_probe.cc
 FREQ=868300000
 RATE=1000000
 GAIN=50
+QUIET=(-q)
 ARGS=()
 
 while [ $# -gt 0 ]; do
@@ -28,6 +29,7 @@ while [ $# -gt 0 ]; do
     --sweep)     ARGS+=(-s 0,10,20,30,40,50,61); shift ;;
     --antennas)  ARGS+=(-A); shift ;;
     --test-tone) ARGS+=(-t); shift ;;
+    --progress)  QUIET=(); shift ;;
     --rate)      RATE=$2; shift 2 ;;
     --gain)      GAIN=$2; shift 2 ;;
     --freq)      FREQ=$2; shift 2 ;;
@@ -42,10 +44,16 @@ if [ ! -x "$BIN" ] || [ "$SRC" -nt "$BIN" ]; then
   g++ -O2 -o "$BIN" "$SRC" -lSoapySDR || { echo "build failed" >&2; exit 1; }
 fi
 
+# SoapySDR colourises its warnings; strip that so the output is readable in a log
+ESC=$(printf '\033')
+clean() { sed -e "s/${ESC}\[[0-9;]*m//g"; }
+
 echo "==================== what SoapySDR says ===================="
-SoapySDRUtil --probe="driver=lime" 2>&1 | grep -vE "^\[INFO\]" | \
+SoapySDRUtil --probe="driver=lime" 2>&1 | clean | grep -vE "^\[INFO\]" | \
   grep -E "^(Probe|  *(driver|hardware|boardSerialNumber|firmwareVersion|gatewareVersion|hardwareVersion|protocolVersion|Antennas|Full gain range|Sample rates|Stream formats|Native format))|WARNING|Expected gateware|But found" | head -40
 
 echo
 echo "==================== sample capture ===================="
-exec "$BIN" -f "$FREQ" -r "$RATE" -g "$GAIN" "${ARGS[@]}"
+# The gateware-mismatch warning is reported once above; drop the repeat here
+"$BIN" -f "$FREQ" -r "$RATE" -g "$GAIN" "${QUIET[@]}" "${ARGS[@]}" 2>&1 | clean | \
+  grep -vE "^\[INFO\]|Gateware version mismatch|Expected gateware|But found version|Follow the FW|Or run update|wiki\.myriadrf"
