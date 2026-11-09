@@ -1,0 +1,10 @@
+# built binary (rebuild with scripts/probe-limesdr.sh)
+limesdr_probe
+
+# captured I/Q dumps and logs
+*.u8
+*.log
+
+# editor / OS noise
+*~
+.DS_Store
