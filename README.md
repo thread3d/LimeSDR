@@ -20,6 +20,7 @@ Target use: receive the European OGN channels at 868.200 / 868.400 MHz.
 | Antenna (868 MHz omni on RX1_L) | **working** — floor 17–20 dB higher at busy bands than at 868 |
 | Best gain for 868 MHz | **61 dB** (top of range); at 50 dB the receiver was on its own converter floor |
 | On-chip decimation (`RF.Oversample`) | defaults to the highest meaningful ratio (32); measured **no effect** on this LimeSuite build |
+| Both RX channels | work simultaneously (2 × 2 MSps = 4.0 MSps, exactly at the link ceiling) but add nothing for 868 MHz OGN |
 | **Live OGN packet decoding** | **not yet** — the 868 MHz band is quiet; no transmitter audible at this location |
 
 The chain is verified end to end. What is still missing is an OGN transmitter in range: with the

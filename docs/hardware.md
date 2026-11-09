@@ -300,6 +300,75 @@ Note that `ogn-decode` is not installed on this board and is not open source, so
 taken as given rather than measured here. The rate it is sensitive to is the RF rate that scales the
 Fourier spectra `ogn-rf` hands it through `ogn-rf.fifo`.
 
+## Both receivers at once — possible, but of no use for 868 MHz OGN
+
+The LimeSDR-USB has two RX channels, each with its own synthesiser and its own LNA paths
+(`RX1_L/_H/_W` and `RX2_L/_H/_W`). Both are usable:
+
+```
+$ ./limesdr_probe -C 2 -f 868200000 -F 868400000 -r 2000000 -g 61 -n 4000000
+ch0           :  868.2000 MHz  2.000 MSps  61.0 dB  LNAL
+ch1           :  868.4000 MHz  2.000 MSps  61.0 dB  LNAL
+stream        : 2 channels, MTU 2040 samples/ch
+per channel   : 2000446 samples/s (100.0% of real time)
+aggregate     : 4.00 MSps over 2 channels
+```
+
+Independent tuners is the important part: 868.200 and 868.400 MHz ran simultaneously, so they are
+separate synthesisers rather than one shared LO.
+
+### What it costs
+
+Both channels share the one USB link, so their rates add up against the same ~4.1 MSps ceiling:
+
+| Configuration | Aggregate | Delivered |
+|---|---|---|
+| 2 × 1 MSps | 2 MSps | 100.0 % of real time |
+| **2 × 2 MSps** | **4 MSps** | **100.0 %**, zero overflows |
+| 2 × 2.5 MSps | 5 MSps | 2.04 MSps/ch — 81.6 % |
+| 2 × 3 MSps | 6 MSps | 2.04 MSps/ch — 68.0 % |
+
+2 MSps per channel fits the link **exactly**, with nothing left over. That is the ceiling.
+
+### Why it buys nothing here
+
+Three measurements, each pointing the same way:
+
+**A dedicated tuner per channel is not more sensitive — it is less.** The current approach receives
+both OGN channels in one 2 MSps window centred on 868.300 MHz. The alternative would be to give each
+channel its own tuner and a narrower rate. Measured, normalised to 1 Hz of bandwidth:
+
+| Approach | Noise density |
+|---|---|
+| One tuner, 2 MSps, centred 868.300 | **−88.8 dBFS/Hz** |
+| Dedicated tuner on 868.200, 500 ksps | **−83.9 dBFS/Hz** |
+
+The narrow dedicated tuner is ~5 dB **worse**. Splitting the channels does not help.
+
+**Retuning is not the bottleneck either.** A retune costs 64 ms on average (78 ms worst), measured
+on 400 kHz steps across the 902 MHz band. ogn-rf retunes immediately after reading a slot and the
+next slot does not start for around a second, so the cost is absorbed by the idle gap rather than
+eaten out of a slot. Pre-tuning a second receiver to save it would recover nothing.
+
+**There is nowhere for the second channel's samples to go.** `ogn-decode` is closed source and
+consumes one stream; it is what `ogn-rf` writes to `ogn-rf.fifo`. A second receiver produces samples
+that no decoder will read.
+
+### Where it would earn its place
+
+- **Hopping plans (USA/Australia).** Those plans pick a channel per time slot by hash across 25 MHz,
+  so a single receiver can only cover the subset of the four hopped frequencies that falls inside one
+  sample-rate window. Two tuners could cover two windows. The decoder constraint above would still
+  have to be solved first.
+- **Direction finding.** Two channels can be made phase-coherent, and `SoapyLMS7` even offers an
+  `align phase` stream argument. This was **not** verified here: the LMS7002M's digital test tone is
+  injected after the mixer, so it shows a stable zero phase regardless of the LOs, and there is no
+  second antenna or splitter to present a common RF signal to both channels. Any DF work would need
+  that measurement first, plus a second antenna feed.
+
+For the European 868 MHz plan — two channels 200 kHz apart, both already inside one 2 MSps window —
+using both receivers adds nothing.
+
 ## See also
 
 - [`ogn-rf-integration.md`](ogn-rf-integration.md) — how the backend maps these facts onto ogn-rf,

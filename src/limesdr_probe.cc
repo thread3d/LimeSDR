@@ -214,6 +214,86 @@ static int doScan(SoapySDR::Device *Dev, double From, double To, double Step,
     putchar('\n'); }
   return 0; }
 
+static const char *LnaPathFor(double Frequency) { return Frequency<1500e6 ? "LNAL" : "LNAH"; }
+
+
+// ---------------------------------------------------------------------------------------------
+// Both receivers at once.
+//
+// The LimeSDR-USB has two independent RX channels with independent synthesisers, so they can be
+// tuned and streamed simultaneously. This exercises that: tunes both, reads one stream carrying
+// two channels, and reports per-channel statistics and the aggregate throughput.
+//
+// The number that matters is the aggregate: the two channels' rates add up against one USB link,
+// which sustains about 4.1 MSps, so 2 x 2 MSps fits with nothing to spare.
+// ---------------------------------------------------------------------------------------------
+static int doDual(SoapySDR::Device *Dev, double F0, double F1, double Rate, double GainDb,
+                  long SamplesWanted, int Shift)
+{ const double Freq[2] = { F0, F1 };
+  for(int Ch=0; Ch<2; Ch++)
+  { Dev->setSampleRate(SOAPY_SDR_RX, Ch, Rate);
+    Dev->setFrequency(SOAPY_SDR_RX, Ch, Freq[Ch]);
+    Dev->setGainMode(SOAPY_SDR_RX, Ch, false);
+    Dev->setGain(SOAPY_SDR_RX, Ch, GainDb);
+    std::vector<std::string> Ants=Dev->listAntennas(SOAPY_SDR_RX, Ch);
+    const char *Want=LnaPathFor(Freq[Ch]);
+    for(size_t Idx=0; Idx<Ants.size(); Idx++)
+      if(Ants[Idx]==Want) { Dev->setAntenna(SOAPY_SDR_RX, Ch, Ants[Idx]); break; }
+    printf("ch%d           : %9.4f MHz  %.3f MSps  %.1f dB  %s\n", Ch,
+           Dev->getFrequency(SOAPY_SDR_RX,Ch)/1e6, Dev->getSampleRate(SOAPY_SDR_RX,Ch)/1e6,
+           Dev->getGain(SOAPY_SDR_RX,Ch), Want); }
+
+  std::vector<size_t> Channels; Channels.push_back(0); Channels.push_back(1);
+  SoapySDR::Stream *Stream=Dev->setupStream(SOAPY_SDR_RX, SOAPY_SDR_CS16, Channels);
+  if(Stream==0) { fprintf(stderr,"setupStream(2 channels) failed\n"); return -1; }
+  size_t Mtu=Dev->getStreamMTU(Stream);
+  printf("stream        : 2 channels, MTU %zu samples/ch\n", Mtu);
+
+  std::vector<std::vector<int16_t> > Buf(2, std::vector<int16_t>(2*Mtu));
+  std::vector<void *> Buffs(2);
+  Buffs[0]=&Buf[0][0]; Buffs[1]=&Buf[1][0];
+
+  Dev->activateStream(Stream);
+
+  double Sum[2]={0,0}, SumSq[2]={0,0}; double Min8[2]={1e9,1e9}, Max8[2]={-1e9,-1e9};
+  long Done=0; int Over=0, Err=0;
+  double Started=now_sec();
+
+  while(Done<SamplesWanted)
+  { int Flags=0; long long TimeNs=0;
+    int Ret=Dev->readStream(Stream, &Buffs[0], Mtu, Flags, TimeNs, 500000);
+    if(Ret==SOAPY_SDR_TIMEOUT) continue;
+    if(Ret==SOAPY_SDR_OVERFLOW) { Over++; continue; }
+    if(Ret<0) { Err++; break; }
+    for(int Ch=0; Ch<2; Ch++)
+    { for(int Idx=0; Idx<Ret; Idx++)
+      { int16_t I=Buf[Ch][2*Idx+0], Q=Buf[Ch][2*Idx+1];
+        int U8I=(I>>Shift)+128; if(U8I<0) U8I=0; if(U8I>255) U8I=255;
+        int U8Q=(Q>>Shift)+128; if(U8Q<0) U8Q=0; if(U8Q>255) U8Q=255;
+        double A=U8I-128.0, B=U8Q-128.0;
+        Sum[Ch]+=0.5*(A+B); SumSq[Ch]+=0.5*(A*A+B*B);
+        if(U8I<Min8[Ch]) Min8[Ch]=U8I; if(U8I>Max8[Ch]) Max8[Ch]=U8I;
+        if(U8Q<Min8[Ch]) Min8[Ch]=U8Q; if(U8Q>Max8[Ch]) Max8[Ch]=U8Q; } }
+    Done+=Ret; }
+
+  double Elapsed=now_sec()-Started;
+  Dev->deactivateStream(Stream); Dev->closeStream(Stream);
+
+  printf("captured      : %ld samples/ch in %.3f s\n", Done, Elapsed);
+  printf("per channel   : %.0f samples/s (%.1f%% of real time)\n",
+         Elapsed>0 ? Done/Elapsed : 0.0, (Rate>0 && Elapsed>0) ? 100.0*(Done/Elapsed)/Rate : 0.0);
+  printf("aggregate     : %.2f MSps over 2 channels%s\n",
+         2.0*(Elapsed>0 ? Done/Elapsed : 0.0)/1e6,
+         Over ? "  (with overflows)" : "");
+  for(int Ch=0; Ch<2; Ch++)
+  { double N=2.0*Done;
+    double Mean=N>0?Sum[Ch]/N:0, Var=N>0?fabs(SumSq[Ch]/N-Mean*Mean):0;
+    printf("  ch%d         : mean %6.2f  sd %5.2f  min %3.0f  max %3.0f\n",
+           Ch, Mean+128.0, sqrt(Var), Min8[Ch], Max8[Ch]); }
+  if(Over) printf("overflows     : %d\n", Over);
+  if(Err)  printf("errors        : %d\n", Err);
+  return 0; }
+
 // ---------------------------------------------------------------------------------------------
 int main(int argc, char **argv)
 { const char *Serial=0;
@@ -226,9 +306,11 @@ int main(int argc, char **argv)
   int Verbose=1, Shift=8, TestSignal=(-1);
   int Scan=0; double ScanFrom=0, ScanTo=0, ScanStep=0;
   std::vector<std::string> Settings;      // -X key=value, applied before the sample rate
+  int    Dual=0;                          // -C 2: drive both receivers at once
+  double Freq2=868400000.0;               // second channel frequency
 
   int Opt;
-  while((Opt=getopt(argc, argv, "d:f:r:g:n:o:s:a:S:X:thq"))!=-1)
+  while((Opt=getopt(argc, argv, "d:f:F:r:g:n:o:s:a:S:X:C:thq"))!=-1)
   { switch(Opt)
     { case 'd': Serial=optarg; break;
       case 'f': Freq=atof(optarg); break;
@@ -239,6 +321,8 @@ int main(int argc, char **argv)
       case 'a': Antenna=optarg; break;
       case 'A': AllAntennas=1; break;
       case 'X': Settings.push_back(optarg); break;
+      case 'C': Dual=atoi(optarg); break;
+      case 'F': Freq2=atof(optarg); break;
       case 'S': { Scan=1; std::string Spec=optarg;
                   double V[3]={0,0,0}; int Field=0; size_t Pos=0;
                   while( (Pos<Spec.size()) && (Field<3) )
@@ -262,6 +346,7 @@ int main(int argc, char **argv)
                "          [-s gain,gain,...] [-a LNAL|LNAH|LNAW] [-A] [-S from:to:step] [-t] [-q]\n"
                "  -S  scan from:to:step in MHz, reporting power per step\n"
                "  -X  key=value device setting, repeatable (e.g. -X OVERSAMPLING=4)\n"
+               "  -C 2      use both receivers; -F <Hz> sets the second channel frequency\n"
                "  -s  sweep these gains, one capture each\n"
                "  -a  select an LNA path explicitly (default: chosen from the frequency)\n"
                "  -A  try every LNA path in turn (find out which connector the antenna is on)\n"
@@ -341,7 +426,11 @@ int main(int argc, char **argv)
     SoapySDR::Range Range=Dev->getGainRange(SOAPY_SDR_RX,0);
     printf("gain range    : %.1f .. %.1f dB\n", Range.minimum(), Range.maximum());
 
-    if(Scan)
+    if(Dual==2)
+    { printf("\ndual receiver capture\n");
+      Ret=doDual(Dev, Freq, Freq2, Rate, GainDb, SamplesWanted, Shift);
+    }
+    else if(Scan)
     { printf("\nscanning %.1f .. %.1f MHz in %.3f MHz steps at %.1f dB gain\n",
              1e-6*ScanFrom, 1e-6*ScanTo, 1e-6*ScanStep, GainDb);
       Ret=doScan(Dev, ScanFrom, ScanTo, ScanStep, GainDb, SamplesWanted);
