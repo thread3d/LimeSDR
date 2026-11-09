@@ -369,6 +369,81 @@ that no decoder will read.
 For the European 868 MHz plan — two channels 200 kHz apart, both already inside one 2 MSps window —
 using both receivers adds nothing.
 
+## Frequency hopping — there is none in Europe, so nothing to fix
+
+Worth being precise about, because "hopping" sounds like a problem to solve and here it is not.
+
+The European plan (`FreqPlan = 1`) is two channels **200 kHz apart**: 868.200 and 868.400 MHz. The
+plan logic alternates channel between time slot 0 and slot 1, but both of those frequencies are
+inside a single capture window. `ogn-rf`'s `calcCenterFreq()` collects the four (slot × OGN/FLARM)
+frequencies, sorts them, and — whenever the whole span fits inside `SampleRate − 150 kHz` — centres
+on the midpoint:
+
+```
+HopFreq = { 868.2, 868.4, 868.4, 868.2 }   span 200 kHz
+Band    = SampleRate - 150 kHz            = 1.85 MHz at 2 MSps, 850 kHz at 1 MSps
+200 kHz < Band  =>  CenterFreq = 868.300 MHz   for every time slot
+```
+
+So the receiver tunes to 868.300 MHz once and **never retunes again**. The "hop" between slot 0 and
+slot 1 is covered by receiving both channels simultaneously, at any sample rate above about
+350 kHz. There is no retune to make fast, and no clock source needed to make one reliable.
+
+### A retune that changes nothing used to cost the same as a real one
+
+SoapyLMS7 does not skip a `setFrequency()` that would program the frequency already in use, and
+`ogn-rf` calls `setCenterFreq(NextCenterFreq)` after every slot. In Europe `NextCenterFreq` is
+always 868.300 MHz, so that was ~58 ms of pointless PLL re-lock and calibration on every slot.
+The backend now remembers the LO it last programmed and returns immediately when it has not
+changed. Measured through the backend:
+
+| Call | Before | After |
+|---|---|---|
+| `setCenterFreq(868.300 MHz)` unchanged, ×10 | 567 ms | **0.00 ms** |
+| `setCenterFreq(±400 kHz)` — a real retune, ×10 | 571 ms | 578 ms (57.8 ms each) |
+
+Real retunes still cost what they cost; there are simply none to do here. That matters if you ever
+do move to a plan that hops — a single retune is 58 ms against a one-second slot, and doing it from
+cold leaves the receiver deaf for the start of the slot.
+
+## A clock source: what it would and would not fix
+
+The board's reference is a **Rakon RPT7050A 30.72 MHz VCTCXO, ±1 ppm initial and ±4 ppm over
+temperature and ageing** — which at 868 MHz is roughly ±0.9 kHz to ±3.5 kHz. The LimeSDR-USB
+hardware supports disciplining it ("possibility to lock VCTCXO to external clock or tune VCTCXO by
+onboard DAC").
+
+What a good external reference (GPSDO or OCXO) would buy:
+
+- **Absolute frequency accuracy**, from ~1–4 ppm to better than 0.01 ppm. That is what `ogn-rf`'s
+  GSM calibration loop exists to measure and correct; a disciplined reference makes it unnecessary.
+  Currently `RF.FreqCorr = 0` and the GSM calibration is disabled (`RF.GSM.CenterFreq = 0`), so the
+  receiver relies entirely on the VCTCXO's own accuracy.
+- **Sample-clock accuracy**, hence tighter slot timing.
+- **Phase coherence between RX0 and RX1**, if both derive from the same reference — which is the
+  prerequisite for any direction-finding work with the second receiver.
+
+What it would **not** buy:
+
+- **Faster retuning.** The 58 ms is PLL re-lock plus the LMS7002M's automatic calibration. It is
+  chip-internal and independent of reference stability.
+- **Anything to do with hopping in Europe**, because there is no hopping.
+
+### But SoapySDR cannot reach it on this build
+
+The hardware supports an external reference; the software stack here does not expose it. Measured:
+
+```
+listClockSources()     -> 0 sources offered
+getMasterClockRates()  -> empty, fixed master clock 80000000 Hz
+```
+
+The SoapyLMS7 support module in LimeSuite 20.01 offers no clock-source selection and no
+master-clock control, so disciplining the VCTCXO from `ogn-rf` is not reachable through SoapySDR. It
+would need either a newer LimeSuite that exposes it, or driving the VCTCXO tuning DAC directly —
+both outside this backend. Worth knowing before buying a reference: the frequency accuracy win is
+real, but the plumbing to use it is not present yet.
+
 ## See also
 
 - [`ogn-rf-integration.md`](ogn-rf-integration.md) — how the backend maps these facts onto ogn-rf,
