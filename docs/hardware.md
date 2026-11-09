@@ -444,6 +444,19 @@ would need either a newer LimeSuite that exposes it, or driving the VCTCXO tunin
 both outside this backend. Worth knowing before buying a reference: the frequency accuracy win is
 real, but the plumbing to use it is not present yet.
 
+## The LNA path follows the antenna, not the datasheet
+
+The LNA paths are band-limited — LNAL 0.7–0.9 GHz, LNAW 0.7–2.6 GHz, LNAH 2–2.6 GHz — and **each maps
+to a different SMA connector**: LNAL to RX1_L, LNAW to RX1_W. With the only antenna on RX1_L, choosing
+strictly by band would put 0.9–2.6 GHz on RX1_W, which has nothing attached. That fails silently,
+because an unconnected port still shows the receiver's own noise floor.
+
+This was measured the hard way: for the GSM accuracy scan at 940 MHz the backend first selected LNAW
+(the datasheet-correct path) and the results were self-contradictory; on LNAL — the port the antenna
+is actually on, even though it is a band low for 940 MHz — the same scan gave a clean, reproducible
++14.4 ppm. The code therefore prefers LNAL up to 1.5 GHz and notes that going beyond needs an antenna
+on RX1_W or RX1_H.
+
 ## See also
 
 - [`ogn-rf-integration.md`](ogn-rf-integration.md) — how the backend maps these facts onto ogn-rf,

@@ -307,10 +307,11 @@ int main(int argc, char **argv)
   int Scan=0; double ScanFrom=0, ScanTo=0, ScanStep=0;
   std::vector<std::string> Settings;      // -X key=value, applied before the sample rate
   int    Dual=0;                          // -C 2: drive both receivers at once
+  int    PPM=0;                           // -P: frequency correction to apply, in ppm
   double Freq2=868400000.0;               // second channel frequency
 
   int Opt;
-  while((Opt=getopt(argc, argv, "d:f:F:r:g:n:o:s:a:S:X:C:thq"))!=-1)
+  while((Opt=getopt(argc, argv, "d:f:F:r:g:n:o:s:a:S:X:C:P:thq"))!=-1)
   { switch(Opt)
     { case 'd': Serial=optarg; break;
       case 'f': Freq=atof(optarg); break;
@@ -322,6 +323,7 @@ int main(int argc, char **argv)
       case 'A': AllAntennas=1; break;
       case 'X': Settings.push_back(optarg); break;
       case 'C': Dual=atoi(optarg); break;
+      case 'P': PPM=atoi(optarg); break;
       case 'F': Freq2=atof(optarg); break;
       case 'S': { Scan=1; std::string Spec=optarg;
                   double V[3]={0,0,0}; int Field=0; size_t Pos=0;
@@ -347,6 +349,7 @@ int main(int argc, char **argv)
                "  -S  scan from:to:step in MHz, reporting power per step\n"
                "  -X  key=value device setting, repeatable (e.g. -X OVERSAMPLING=4)\n"
                "  -C 2      use both receivers; -F <Hz> sets the second channel frequency\n"
+               "  -P <ppm>  apply a frequency correction (the crystal error) before tuning\n"
                "  -s  sweep these gains, one capture each\n"
                "  -a  select an LNA path explicitly (default: chosen from the frequency)\n"
                "  -A  try every LNA path in turn (find out which connector the antenna is on)\n"
@@ -421,6 +424,13 @@ int main(int argc, char **argv)
 
 
     Dev->setFrequency(SOAPY_SDR_RX, 0, Freq);
+    if(PPM)
+    { // Applied by moving the LO, which is what limesdr.h does - a positive figure is the crystal
+      // running fast, so the LO is programmed correspondingly low.
+      double LO=Freq*(1.0 - 1e-6*PPM);
+      Dev->setFrequency(SOAPY_SDR_RX, 0, LO);
+      printf("correction    : %+d ppm -> LO %.0f Hz (%.1f kHz below nominal)\n",
+             PPM, LO, (Freq-LO)/1e3); }
     printf("frequency     : %.0f Hz requested, %.0f Hz tuned\n", Freq, Dev->getFrequency(SOAPY_SDR_RX,0));
 
     SoapySDR::Range Range=Dev->getGainRange(SOAPY_SDR_RX,0);

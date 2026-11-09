@@ -61,6 +61,7 @@ the interface the rest of the system already speaks, and it keeps a future secon
 | `setCenterFreq()` | `setFrequency()`; the freq raster is applied first, exactly as librtlsdr does |
 | `setFreqCorrection(ppm)` | **software**: retunes the LO to `freq × (1 + ppm·1e-6)` |
 | `RF.Oversample` | sets SoapyLMS7's `OVERSAMPLING`: converter runs at N × the host rate, on-chip decimation by N |
+| `RF.ClockSource` / `RF.ReferenceRate` | `setClockSource()` / `setReferenceClockRate()` — the latter exists only in SoapySDR 0.8+ and is compiled out below that |
 | `getCenterFreq()` | the *nominal* frequency, i.e. before the ppm correction, so reports stay nominal |
 | `setTunerGain(0.1 dB)` | `setGain()` in dB, clamped to the reported gain range |
 | `getTunerGains()` | synthesised from `getGainRange()` into the same 0.1 dB table format |
@@ -108,6 +109,7 @@ RF = {
   FreqRaster   = 1;              // no raster rounding - unnecessary on an LMS7002M
   SampleRate   = 2000000;        // highest rate ogn-decode accepts; link sustains ~4.1 MSps
   Oversample   = 32;             // stepped down to 16 at 2 MSps to stay inside the converter
+  ClockSource  = "internal";     // or "external", with ReferenceRate in Hz (needs SoapySDR 0.8+)
   OGN = { Gain = 61.0; GainMode = 1; SampleRate = 2000000;
           SensTime = 0.85; StartTime = 0.375; };
 };
@@ -163,6 +165,17 @@ entirely. Keeping the define in a separate variable means an override keeps the 
 had it been in `FLAGS`, the documented build line would have produced a binary that silently could
 not select a LimeSDR at all.
 
+### One build-system trap worth knowing
+
+`make` does not track compiler flags, so switching `USE_LIMESDR` between builds does **not** rebuild
+an existing binary — it reports the target up to date and leaves the old one in place, which looks
+exactly like a code failure ("LimeSDR support was not compiled in"). Remove the targets before
+changing backend or include paths:
+
+```bash
+rm -f ogn-rf gsm_scan && make USE_LIMESDR=1 FLAGS="..." LIBS="..." ogn-rf gsm_scan
+```
+
 ## What was verified
 
 All on the board, with the branch built and running:
@@ -192,6 +205,55 @@ the direct evidence that the conversion and the DC handling are right.
 no decoder attached nothing drains `OutQueue`, so ogn-rf halves its read window and then starts
 dropping. Draining `ogn-rf.fifo` raises the reported live time immediately. The same message pair
 appears on the KrakenSDR/RTL-SDR build.
+
+## Reference clock and frequency accuracy
+
+`RF.ClockSource` ("internal"/"external") and `RF.ReferenceRate` (Hz) are applied before the rate and
+tuning, because the reference is what the PLLs lock to. The rate half is guarded by
+`SOAPY_SDR_API_VERSION >= 0x00080000`; against SoapySDR 0.7.x it is compiled out and the backend says
+so rather than failing to build. Both builds were verified: the 0.8 build contains the reference-rate
+path, the 0.7 build contains the "ignored, needs 0.8+" message.
+
+**Selecting an external reference proves nothing.** Measured on this board: with nothing attached,
+`setClockSource("external")` returns normally, reception is completely unaffected, and the
+`clock_locked` sensor still reads `true` — the chip simply stays on its VCTCXO. Anything that reads
+`getClockSource()` and concludes "disciplined" is wrong. The status page therefore reports both the
+requested and the device-reported source (`external / device says external`) rather than either alone.
+
+### Measuring the actual error — `gsm_scan --limesdr`
+
+`gsm_scan` (in this repo) estimates the crystal error from GSM broadcast carriers, which are
+frequency-accurate because the base stations are GPS-locked. It previously only drove an RTL-SDR; it
+now takes `--limesdr` and works through the same `SDR_Device` switch:
+
+```
+$ ./gsm_scan --limesdr --gain 30
+936.600MHz:   +6.8dB: +13.74 +13.15 +14.39 +14.40 +14.40 [ppm]
+942.800MHz:   +4.2dB: +14.41 +14.43 +14.43 +14.40 +14.33 [ppm]
+944.800MHz:   +0.0dB: +14.45 +14.46 +14.45 +14.47 +14.30 [ppm]
+Receiver Xtal correction = 0+14.400 = +14.400 (0.052) ppm [18]
+```
+
+**This board's VCTCXO measured +14.4 ppm, ±0.05 ppm across 18 windows**, reproduced at a second gain
+(+14.396 at 40 dB), which is about **+12.5 kHz at 868.300 MHz**. Note that is well outside the
+VCTCXO's ±1 ppm initial specification, which is itself interesting — a VCTCXO's output depends on its
+tuning voltage, so it is plausibly being pulled by the driver's DAC setting. `RF.FreqCorr = 14`
+compensates it in software today.
+
+Two caveats on that number. Reception at 925–960 MHz is **off-band for the attached antenna** (an
+868 MHz omni on RX1_L, which covers 0.7–0.9 GHz), so the tool intermittently false-locks — an earlier
+run through `LNAW` produced self-contradictory clusters at +72 and −13 ppm. The +14.4 figure comes
+from runs that were internally consistent and reproduced across gains, but a trustworthy absolute
+calibration wants an antenna on RX1_W (with `LNAW`) or a real reference.
+
+### A sign bug this measurement found
+
+`setFreqCorrection(ppm)` was applying the correction as `LO × (1 + ppm·1e-6)`, which *adds* the error
+instead of removing it. The evidence: with the receiver reading +14.4 ppm, applying `--ppm 30`
+produced a residual of +44.1 ppm — 14.4 + 30, a sum. It is now `LO × (1 − ppm·1e-6)`, matching
+librtlsdr's convention where the value is the error *of the crystal*, confirmed independently at the
+spectrum level: a +100 ppm correction at 944.8 MHz moved the observed peak by +94.2 kHz, exactly the
+94.5 kHz the LO was shifted.
 
 ## Known limitations
 

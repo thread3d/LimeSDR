@@ -85,8 +85,10 @@ cd "$DIR" || exit 1
 
 pkill -x ogn-rf 2>/dev/null
 sleep 1
-# ogn-rf needs stdin open, and line buffering to log anything at all
-setsid bash -c "sleep infinity | stdbuf -oL -eL '$OGN' '$CONF' > /tmp/ogn-rf-verify.log 2>&1" \
+# ogn-rf needs stdin open, and line buffering to log anything at all. The producer is a BOUNDED
+# sleep, not "sleep infinity": when this script kills ogn-rf afterwards, an endless producer would
+# outlive it and leave a stray pipeline behind on every run (which is exactly what happened).
+setsid bash -c "sleep $((SECS+15)) | stdbuf -oL -eL '$OGN' '$CONF' > /tmp/ogn-rf-verify.log 2>&1" \
   < /dev/null > /dev/null 2>&1 &
 sleep 6
 
