@@ -125,9 +125,9 @@ Steps, roughly:
 5. Only then add `RF.ClockSource` and `RF.ReferenceRate` to the `limesdr` branch, and re-measure
    accuracy with a disciplined source attached.
 
-Rough effort: build time is dominated by LimeSuite (the big library) — order of 10–20 minutes at
-`-j4` on this Jetson is my estimate, unverified; plus verification. Call it an afternoon including
-re-testing, not including anything physical.
+Rough effort: the spike took **about 4 minutes** to build both libraries at `-j4` — far less than
+my earlier 10–20 minute estimate, which was wrong in the encouraging direction. The real work is the
+verification and the config plumbing, not the compile.
 
 ## Risks
 
@@ -142,15 +142,93 @@ re-testing, not including anything physical.
 - **Unbuilt.** The build has not been attempted, so "it compiles on falcon" is an inference from
   declared requirements and the available toolchain, not a result.
 
-## Open questions to settle before committing
+## Spike results — it builds and works, with one important warning
 
-1. Does LimeSuite 23.11 build here at all, and does its SoapyLMS7 module load into SoapySDR 0.8.1?
-2. Does the reception baseline survive (throughput, scaling, calibration behaviour)?
-3. Does `setClockSource("external")` do anything observable with **no** reference attached — and does
-   it fail cleanly rather than quietly breaking reception? This matters: it should be testable
-   *before* buying hardware.
-4. What external reference rate does this board accept through `SetClockFreq(LMS_CLOCK_EXTREF, …)`,
-   and is the input physically accessible (u.FL) on this revision?
+The build was carried out in a private prefix (`~/projects/LimeSDR/deps/refclock`), leaving the
+system 0.7 stack completely untouched. Everything below was measured, not inferred.
+
+### It builds (and quickly)
+
+```
+SoapySDR   0.8.1  -> $PREFIX, ABI v0.8
+LimeSuite 23.11.0 -> $PREFIX, module libLMS7Support.so (23.11.0) in lib/SoapySDR/modules0.8
+Total elapsed: about 4 minutes at -j4 (I had estimated 10-20; it is much cheaper than that).
+```
+
+The new stack finds the radio:
+
+```
+$ LD_LIBRARY_PATH=$PREFIX/lib $PREFIX/bin/SoapySDRUtil --info
+  Lib Version: v0.8.1-unknown     ABI Version: v0.8
+  Search path: .../refclock/lib/SoapySDR/modules0.8
+  Module found: .../libLMS7Support.so (23.11.0)
+  Available factories... lime
+$ ... --find   ->   driver = lime   serial = 00090726074D1731
+```
+
+Practical note: SoapySDR's install did not bake an rpath into its own binaries, so anything run
+from the prefix needs `LD_LIBRARY_PATH=$PREFIX/lib`, and anything linked against it needs
+`-Wl,-rpath,$PREFIX/lib`.
+
+### The reception baseline survives, unchanged
+
+Same probe, same settings, built twice — once against the system stack, once against the prefix:
+
+| Stack | mean | sd | min/max | clipping | throughput |
+|---|---|---|---|---|---|
+| System: SoapySDR 0.7.2 + LimeSuite 20.01 | 127.75 | 1.73 | 112–145 | 0.000 % | 100.3 % of real time |
+| Prefix: SoapySDR 0.8.1 + LimeSuite 23.11 | 127.75 | 1.72 | 110–145 | 0.000 % | 100.3 % of real time |
+
+Identical within run-to-run noise. Gain distribution, calibration behaviour and the CS16→8-bit
+scaling all survive the driver upgrade at 2 MSps.
+
+### The clock API is there — and it will lie to you
+
+```
+listClockSources      : 2  [internal] [external]
+getClockSource        : 'internal'
+getReferenceClockRate : 0 Hz
+getReferenceClockRates: 1 range [0 .. 30720000]      <- a 10 MHz reference is in range
+```
+
+Selecting `external` **with no reference attached**:
+
+```
+setClockSource("external")  -> returned normally, no exception
+getClockSource()            -> 'external'
+reception                   -> mean 127.75, sd 1.81, 100.1 % of real time   (unchanged)
+sensor clock_locked         -> 'true'
+setReferenceClockRate(10e6)    -> accepted, reads back 10000000
+setReferenceClockRate(30.72e6) -> accepted, reads back 30720000
+reception                   -> unchanged for both
+```
+
+This is the answer to the question worth asking before buying hardware, and it is a **warning, not
+a reassurance**. Selecting an external reference that does not exist:
+
+- does **not** raise an error,
+- does **not** disturb reception — the radio keeps working off its internal reference, and
+- leaves `clock_locked` reading **`true`**.
+
+So there is no positive confirmation anywhere that the discipline actually took effect. A receiver
+configured this way looks perfectly healthy while silently running on its own VCTCXO. The only real
+check is measuring absolute frequency accuracy against a known-good reference — which is the thing
+the hardware was meant to provide in the first place. Plan for that measurement; do not trust
+`getClockSource()` returning `'external'`.
+
+## Open questions
+
+1. ~~Does LimeSuite 23.11 build here, and does its SoapyLMS7 module load into SoapySDR 0.8.1?~~
+   **Answered: yes.** About 4 minutes, module loads, device enumerates.
+2. ~~Does the reception baseline survive?~~ **Answered: yes**, identical to within noise.
+3. ~~Does `setClockSource("external")` fail cleanly with no reference attached?~~ **Answered — and
+   it is subtler than "cleanly":** it succeeds silently, reception is unaffected, and `clock_locked`
+   still reports `true`. No confirmation is available that it did anything.
+4. **Still open:** what reference rate this board's EXTREF input actually accepts and whether the
+   input is physically accessible (u.FL populated?) on this revision. Software accepts any rate up
+   to 30.72 MHz; that is not evidence the connector exists or is wired. Needs a look at the board.
+5. **Still open:** the real accuracy benefit, which cannot be measured without a reference to
+   discipline against. This is the one thing the spike could not test.
 
 ## The cheaper option, for comparison
 
